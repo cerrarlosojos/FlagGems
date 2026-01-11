@@ -1468,13 +1468,13 @@ GRID_SAMPLE_SHAPES = [
 ]
 
 # Mode mapping: string to int for grid_sampler_2d
-GRID_SAMPLE_MODE_MAP = {"bilinear": 0, "nearest": 1}
+GRID_SAMPLE_MODE_MAP = {"bilinear": 0, "nearest": 1, "bicubic": 2}
 GRID_SAMPLE_PADDING_MAP = {"zeros": 0, "border": 1, "reflection": 2}
 
 
 @pytest.mark.grid_sample
 @pytest.mark.parametrize("shape", GRID_SAMPLE_SHAPES)
-@pytest.mark.parametrize("mode", ["bilinear", "nearest"])
+@pytest.mark.parametrize("mode", ["bilinear", "nearest", "bicubic"])
 @pytest.mark.parametrize("padding_mode", ["zeros", "border", "reflection"])
 @pytest.mark.parametrize("align_corners", [True, False])
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
@@ -1487,8 +1487,9 @@ def test_accuracy_grid_sample(shape, mode, padding_mode, align_corners, dtype):
     # CPU grid_sampler_2d doesn't support Half, use float32 for reference
     ref_inp = to_reference(inp).to(torch.float32)
 
-    # Grid: normalized coordinates in [-1, 1]
-    grid = torch.rand(N, H_out, W_out, 2, dtype=dtype, device=flag_gems.device) * 2 - 1
+    # Grid: normalized coordinates in [-3, 3]
+    # Include out-of-bound [-1, 1] locations to test for padding_mode
+    grid = (torch.rand(N, H_out, W_out, 2, dtype=dtype, device=flag_gems.device) - 0.5) * 6
     ref_grid = to_reference(grid).to(torch.float32)
 
     # Convert mode/padding to int
@@ -1514,7 +1515,7 @@ def test_accuracy_grid_sample(shape, mode, padding_mode, align_corners, dtype):
     "shape", GRID_SAMPLE_SHAPES[:3]
 )  # Use fewer shapes for backward
 @pytest.mark.parametrize("mode", ["bilinear"])  # Nearest has no grid gradient
-@pytest.mark.parametrize("padding_mode", ["zeros", "border"])
+@pytest.mark.parametrize("padding_mode", ["zeros", "border", "reflection"])
 @pytest.mark.parametrize("align_corners", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32])  # Use float32 for gradient stability
 def test_accuracy_grid_sample_backward(shape, mode, padding_mode, align_corners, dtype):
@@ -1537,7 +1538,7 @@ def test_accuracy_grid_sample_backward(shape, mode, padding_mode, align_corners,
     )
 
     # Grid (requires grad)
-    grid = torch.rand(N, H_out, W_out, 2, dtype=dtype, device=flag_gems.device) * 2 - 1
+    grid = (torch.rand(N, H_out, W_out, 2, dtype=dtype, device=flag_gems.device) - 0.5) * 6
     grid.requires_grad = True
     ref_grid = (
         grid.detach()
