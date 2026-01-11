@@ -14,8 +14,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 INTERPOLATION_BILINEAR = tl.constexpr(0)
 INTERPOLATION_NEAREST = tl.constexpr(1)
-# Bicubic is omitted for brevity and complexity, matching common custom op scope.
-# But the enum is reserved as 2.
+INTERPOLATION_BICUBIC = tl.constexpr(2)
 
 PADDING_ZEROS = tl.constexpr(0)
 PADDING_BORDER = tl.constexpr(1)
@@ -59,20 +58,22 @@ def reflect_coordinates(x, twice_low, twice_high):
     # Map x to [0, span]
     x = tl.abs(x - min_val)
     # Reflect using modulo logic similar to ATen:
-    # Python/Triton % behaves like floor mod, we need to handle reflection
-    # Logic: fmod based reflection
-    # A simpler approximation for reflection often used:
-    # d = 2 * span
-    # x = abs((x + span) % d - span) (shifted) -> this is complex to implement generically.
-    # Let's use the explicit unfolding similar to ATen:
+    # Compute fmod(in, span) = in - span * floor(in / span)
+    # where we need fmod then check flips = floor(in / span)
+    # if flips is even: return extra + min
+    # if flips is odd: return span - extra + min
 
-    # Scale to simplify modulo
-    x = x / span
-    x = x - 2.0 * tl.floor(x * 0.5)  # x % 2
-    # if x > 1.0 -> 2.0 - x, else x
-    x = tl.where(x > 1.0, 2.0 - x, x)
+    # Calculate: flips = floor(x / span), extra = x - span * flips
+    # We can compute extra = fmod(x, span) using:
+    # extra = x - span * floor(x / span)
+    flips = tl.floor(x / span)
+    extra = x - span * flips
+    # Now check if flips is even or odd
+    # if flips % 2 == 0: reflected = extra
+    # else: reflected = span - extra
+    reflected = tl.where(flips % 2 == 0, extra, span - extra)
 
-    return x * span + min_val
+    return reflected + min_val
 
 
 @triton.jit
@@ -103,6 +104,48 @@ def safe_clamp(x, lo, hi):
     x = tl.where(x < lo, lo, x)
     x = tl.where(x > hi, hi, x)
     return x
+
+
+@triton.jit
+def cubic_convolution1(x, A: tl.constexpr):
+    return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+
+
+@triton.jit
+def cubic_convolution2(x, A: tl.constexpr):
+    return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+
+
+@triton.jit
+def get_cubic_coeffs(t, i: tl.constexpr):
+    A = -0.75
+    x1 = t
+    x2 = 1.0 - t
+    if i == 0:
+        return cubic_convolution2(x1 + 1.0, A)
+    elif i == 1:
+        return cubic_convolution1(x1, A)
+    elif i == 2:
+        return cubic_convolution1(x2, A)
+    else:
+        return cubic_convolution2(x2 + 1.0, A)
+
+
+@triton.jit
+def get_cubic_coeffs_grad(t, i: tl.constexpr):
+    A = -0.75
+    x1 = -1.0 - t
+    x2 = -t
+    x3 = 1.0 - t
+    x4 = 2.0 - t
+    if i == 0:
+        return (-3.0 * A * x1 - 10.0 * A) * x1 - 8.0 * A
+    elif i == 1:
+        return (-3.0 * (A + 2.0) * x2 - 2.0 * (A + 3.0)) * x2
+    elif i == 2:
+        return (3.0 * (A + 2.0) * x3 - 2.0 * (A + 3.0)) * x3
+    else:
+        return (3.0 * A * x4 - 10.0 * A) * x4 + 8.0 * A
 
 
 # -----------------------------------------------------------------------------
@@ -298,6 +341,33 @@ def grid_sampler_2d_fwd_kernel(
                 )
 
             out_val = val_nw * nw + val_ne * ne + val_sw * sw + val_se * se
+            tl.store(base_y_ptr, out_val, mask=mask_c)
+
+        elif interpolation_mode == INTERPOLATION_BICUBIC:
+            ix_f = get_position(gx, w_in, align_corners)
+            iy_f = get_position(gy, h_in, align_corners)
+            ix_i = tl.floor(ix_f)
+            iy_i = tl.floor(iy_f)
+            tx = ix_f - ix_i
+            ty = iy_f - iy_i
+            out_val = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+            for i in range(4):
+                y_line = iy_i - 1 + i
+                coeff_y = get_cubic_coeffs(ty, i)
+                for j in range(4):
+                    x_line = ix_i - 1 + j
+                    coeff = get_cubic_coeffs(tx, j) * coeff_y
+                    if padding_mode == PADDING_ZEROS:
+                        if within_bounds(x_line, y_line, h_in, w_in):
+                            off = (y_line.to(tl.int32) * stride_x_h + x_line.to(tl.int32) * stride_x_w)
+                            pixel = tl.load(base_x_ptr + off, mask=mask_c, other=0.0).to(tl.float32)
+                            out_val += pixel * coeff
+                    else:
+                        x_safe = clip_coordinates(x_line, w_in, padding_mode, align_corners)
+                        y_safe = clip_coordinates(y_line, h_in, padding_mode, align_corners)
+                        off = (y_safe.to(tl.int32) * stride_x_h + x_safe.to(tl.int32) * stride_x_w)
+                        pixel = tl.load(base_x_ptr + off, mask=mask_c, other=0.0).to(tl.float32)
+                        out_val += pixel * coeff
             tl.store(base_y_ptr, out_val, mask=mask_c)
 
         elif interpolation_mode == INTERPOLATION_NEAREST:
@@ -656,6 +726,52 @@ def grid_sampler_2d_bwd_kernel(
 
             # Grid gradients are zero for nearest neighbor almost everywhere
 
+        elif interpolation_mode == INTERPOLATION_BICUBIC:
+            tx = ix_clamped - tl.floor(ix_clamped)
+            ty = iy_clamped - tl.floor(iy_clamped)
+            ix_nw = tl.floor(ix_clamped)
+            iy_nw = tl.floor(iy_clamped)
+            if output_mask_input:
+                for i in range(4):
+                    for j in range(4):
+                        x_line = ix_nw - 1 + j
+                        y_line = iy_nw - 1 + i
+                        coeff = get_cubic_coeffs(tx, j) * get_cubic_coeffs(ty, i)
+                        if padding_mode == PADDING_ZEROS:
+                            if within_bounds(x_line, y_line, h_in, w_in):
+                                off = (y_line.to(tl.int32) * stride_gi_h + x_line.to(tl.int32) * stride_gi_w)
+                                tl.atomic_add(base_gi_ptr + off, g_out * coeff, mask=mask_c)
+                        else:
+                            x_safe = clip_coordinates(x_line, w_in, padding_mode, align_corners)
+                            y_safe = clip_coordinates(y_line, h_in, padding_mode, align_corners)
+                            off = (y_safe.to(tl.int32) * stride_gi_h + x_safe.to(tl.int32) * stride_gi_w)
+                            tl.atomic_add(base_gi_ptr + off, g_out * coeff, mask=mask_c)
+            if output_mask_grid:
+                gix_local = 0.0
+                giy_local = 0.0
+                for i in range(4):
+                    for j in range(4):
+                        x_line = ix_nw - 1 + j
+                        y_line = iy_nw - 1 + i
+                        coeff = get_cubic_coeffs(tx, j) * get_cubic_coeffs(ty, i)
+                        dcoeff_dx = get_cubic_coeffs_grad(tx, j) * get_cubic_coeffs(ty, i)
+                        dcoeff_dy = get_cubic_coeffs_grad(ty, i) * get_cubic_coeffs(tx, j)
+                        if padding_mode == PADDING_ZEROS:
+                            if within_bounds(x_line, y_line, h_in, w_in):
+                                off = (y_line.to(tl.int32) * stride_in_h + x_line.to(tl.int32) * stride_in_w)
+                                pixel = tl.load(base_in_ptr + off, mask=mask_c, other=0.0).to(tl.float32)
+                                gix_local -= tl.sum(g_out * pixel * dcoeff_dx)
+                                giy_local -= tl.sum(g_out * pixel * dcoeff_dy)
+                        else:
+                            x_safe = clip_coordinates(x_line, w_in, padding_mode, align_corners)
+                            y_safe = clip_coordinates(y_line, h_in, padding_mode, align_corners)
+                            off = (y_safe.to(tl.int32) * stride_in_h + x_safe.to(tl.int32) * stride_in_w)
+                            pixel = tl.load(base_in_ptr + off, mask=mask_c, other=0.0).to(tl.float32)
+                            gix_local -= tl.sum(g_out * pixel * dcoeff_dx)
+                            giy_local -= tl.sum(g_out * pixel * dcoeff_dy)
+                grad_x_acc += gix_local * x_mult * dx_mult
+                grad_y_acc += giy_local * y_mult * dy_mult
+
     # Store Grid Gradients
     if output_mask_grid:
         base_gg_ptr = (
@@ -819,7 +935,7 @@ def grid_sampler_2d(
     Args:
         input: (N, C, H_in, W_in)
         grid: (N, H_out, W_out, 2)
-        interpolation_mode: 0=Bilinear, 1=Nearest, 2=Bicubic (Bicubic not implemented in this kernel)
+        interpolation_mode: 0=Bilinear, 1=Nearest, 2=Bicubic
         padding_mode: 0=Zeros, 1=Border, 2=Reflection
         align_corners: bool
     """
